@@ -1,0 +1,804 @@
+#! /usr/bin/env python3
+
+#
+# sdriver - Autolab version of the CS:APP Shell Lab Driver
+# Uses a collection of trace files to test a shell implementation.
+# Copyright (c) 2004-2011, R. Bryant and D. O'Hallaron
+# Python rewrite (c) 2023 Z. Weinberg
+#
+
+"""Test driver for Shell lab.  Run this program to test your shell the
+same way Autolab will.  (You may instead want to use the lower-level
+tester, "runtrace"; see the writeup for more explanation of when to
+use each of these programs.)
+"""
+
+import argparse
+import difflib
+import os
+import re
+import shlex
+import signal
+import stat
+import subprocess
+import sys
+
+from pathlib import Path
+
+#
+# Lab configuration parameters.
+#
+
+#: How many seconds should runtrace wait for output from each command?
+COMMAND_TIMEOUT = 4
+
+#: How many seconds is a single trace allowed to run, in total?
+TRACE_TIMEOUT = 30
+
+#: How many iterations should we run of each trace?
+TRACE_ITERATIONS = 3
+
+#: Where are the traces stored?
+TRACES_DIR = "traces"
+
+#: Regex that matches any run of *horizontal* whitespace, defined as any
+#: character that matches \s but does not cause str.splitlines to split.
+#: (All of the characters that cause str.splitlines to split, match \s.)
+#: One could argue with this definition, but that argument should happen
+#: on the python development list, not here :-)
+#:
+#: To recalculate the string below, use
+#:     "".join(f"\\u{n:04X}" for n in range(sys.maxunicode)
+#:             if re.match("\\s", chr(n))
+#:                and len(f"a{chr(n)}b").splitlines() == 1)
+#: This takes a couple of seconds, which is why we don't just run it
+#: every time.
+H_WS_RE = re.compile(
+    "[\u0009\u001F\u0020\u00A0\u1680\u2000\u2001\u2002\u2003\u2004"
+    "\u2005\u2006\u2007\u2008\u2009\u200A\u202F\u205F\u3000]+"
+)
+
+#: Regex that matches process IDs in job control output.
+#: Used in filter_runtrace_expected_variation.
+PID_RE = re.compile(r"\([0-9]+\)")
+
+# For error messages; updated in main
+ME = "sdriver"
+
+
+def split_lines_and_filter_whitespace(text: str) -> list[str]:
+    """Filter out completely uninteresting variation in white space
+    from runtrace output.  This is applied in between the actual
+    output of the runtrace subprocess and the data we describe as
+    "raw".  The following changes are made:
+
+    - The output is split into lines per Python's definition of
+      universal newlines (see
+      https://docs.python.org/3.10/library/stdtypes.html#str.splitlines
+      for the surprisingly long list of line separator characters)
+    - All trailing horizontal whitespace is removed from each line
+    - Leading and trailing blank lines are removed entirely
+    - Finally, the result is reassembled into a list of lines,
+      each *including* a single final \n (difflib requires this).
+    """
+    lines = [l.rstrip() for l in text.splitlines()]
+    while lines and not lines[0]:
+        del lines[0]
+    while lines and not lines[-1]:
+        del lines[-1]
+    for i in range(len(lines)):
+        lines[i] += "\n"
+    return lines
+
+
+def filter_runtrace_expected_variation(text: list[str]) -> list[str]:
+    """Filter out expected variation in runtrace output.
+    Within each line, the following changes are made:
+    - All runs of horizontal whitespace are collapsed to a single space.
+    - To prevent hacks, all occurrences of the fixed string "(PID)" are
+      replaced with "(INVALID)".
+    - All occurrences of a decimal number in parentheses
+      (e.g. "(12345)") are replaced with the fixed string "(PID)".
+    """
+    h_ws_re = H_WS_RE
+    pid_re = PID_RE
+    return [
+        # The invocation of pid_re.sub must happen after the .replace call,
+        # but the order of the .replace call and h_ws_re.sub does not matter.
+        pid_re.sub("(PID)", h_ws_re.sub(" ", l.replace("(PID)", "(INVALID)")))
+        for l in text
+    ]
+
+
+class RuntraceOutputDiffer(difflib.Differ):
+    """Modification of difflib.Differ to make the output easily readable
+    by students who may be unfamiliar with diff(1).
+    """
+
+    _NO_COLOR_LINE_TAGS = {
+        "-": "-ref- ",
+        "+": "+you+ ",
+        " ": "      ",
+        "?": "..... ",
+    }
+
+    # Notes on SGR codes used:
+    # 7: reverse video; 27: cancel reverse video
+    # 36: dim cyan; 93: bright yellow; 90: bright black (dark gray)
+    # less -R resets to "normal" mode at the end of each line, so
+    # runs of - or + lines must each have their own SGR leader.
+    _YES_COLOR_LINE_TAGS = {
+        "-": "\x1b[7;36m-ref-\x1b[27m ",
+        "+": "\x1b[7;93m+you+\x1b[27m ",
+        " ": "\x1b[90m      ",
+    }
+
+    # Matches boundaries between whitespace and graphic characters.
+    # In other words, this regex is to \s and \S as \b is to \w and \W.
+    _split_changemarker_re = re.compile(
+        r"(?: (?<=\s)(?=\S) | (?<=\S)(?=\s) )", re.VERBOSE
+    )
+
+    # Matches lines with no actual content.
+
+    def __init__(self, color: bool):
+        super().__init__(linejunk=None, charjunk=difflib.IS_CHARACTER_JUNK)
+        self._color_output = color
+
+    def filtered_compare(
+        self,
+        ref: list[str],
+        you: list[str],
+    ) -> tuple[bool, list[str]]:
+        """Compare reference shell output (REF) to student's shell's
+        output (YOU) and produce a nicely presented comparison.
+        For our own internal convenience, return not only the list
+        of diff-output lines, but a boolean indicating whether any
+        differences were found.
+        """
+        comparison = list(super().compare(ref, you))
+        return (
+            not all(c[0] == " " for c in comparison),
+            self.filter_comparison(comparison),
+        )
+
+    def filter_comparison(self, raw_comparison: list[str]) -> list[str]:
+        """Filter the output of compare() to make the result more
+        easily readable by students unfamiliar with diff(1); optionally
+        also colorize the output and convert '?' lines to further graphic
+        flourishes on the line they annotate.
+        """
+        comparison: list[str] = []
+        if self._color_output:
+            color_tags = self._YES_COLOR_LINE_TAGS
+            special_ques = True
+        else:
+            color_tags = self._NO_COLOR_LINE_TAGS
+            special_ques = False
+
+        for line in raw_comparison:
+            tag = line[0]
+            line = line[2:-1]  # remove leading tag and space and trailing \n
+            if tag == "?" and special_ques:
+                comparison[-1] = self._annotate_intraline_changes(
+                    comparison[-1], line
+                )
+            else:
+                comparison.append(color_tags[tag] + line)
+
+        # Postprocess: strip all trailing horizontal spaces from each line,
+        # then tack on either "\n" or "\x1b[m\n" as appropriate.
+        for i, line in enumerate(comparison):
+            line = line.rstrip()
+            # Completely blank lines should be emitted as just \n.
+            # It's only possible to have a line consisting of _only_
+            # an SGR code if that code is \x1b[90m.
+            if line == "\x1b[90m" or line == "":
+                line = "\n"
+            else:
+                if self._color_output:
+                    line += "\x1b[m\n"
+                else:
+                    line += "\n"
+            comparison[i] = line
+
+        return comparison
+
+    def _annotate_intraline_changes(self, line: str, tags: str) -> str:
+        """Convert one of Differ's '? ' lines (TAGS), which marks
+        intra-line changes on the previous line (LINE), into
+        additional highlighting of LINE.  Only ever called when
+        self._color_output is True.  LINE is expected already to
+        have been colorized as a whole.
+        """
+        leader, line = line.split(" ", 1)
+        assert len(line) >= len(tags)
+
+        chunks: list[str] = [leader, " "]
+        start = 0
+        caret_to_insert = "+" in leader
+
+        for tag in self._split_changemarker_re.split(tags):
+            # A "tag" is a run of identical characters, space, +, -, or ^.
+            # These correspond to a run of unchanged, inserted, deleted, or
+            # modified characters in LINE.
+            end = start + len(tag)
+            chunk = line[start:end]
+            start = end
+            tag = tag[0]
+            if tag == " ":
+                chunks.append(chunk)
+            elif tag == "-" or (tag == "^" and not caret_to_insert):
+                # SGR codes: 9 = strikethrough, 29 = cancel strikethrough
+                # Not all terminals implement strikethrough, so we also put
+                # in a bright-black background highlight: 100 canceled by 49.
+                chunks.append(f"\x1b[9;100m{chunk}\x1b[29;49m")
+            elif tag == "+" or (tag == "^" and caret_to_insert):
+                # Same as above, except underline (4/24) instead
+                chunks.append(f"\x1b[4;100m{chunk}\x1b[24;49m")
+            else:
+                raise AssertionError(f"unexpected tag type '{tag}'")
+
+        # The tags might end before the end of the actual line, in which
+        # case the rest of the line was not involved in the change
+        if end < len(line):
+            chunks.append(line[end:])
+
+        chunks.append("\x1b[m\n")
+        return "".join(chunks)
+
+    def introduce(
+        self, verbose: bool, ref_invocation: str, you_invocation: str
+    ) -> list[str]:
+        """Produce an introduction to the output.  If VERBOSE is true,
+        explain in detail what each line means, else only a brief reminder.
+        The return value is a list of lines suitable for writelines(),
+        like the list produced by compare()."""
+
+        verbose_lines = [
+            "  Lines like this were output by both shells.\n",
+            "- Lines like this were output only by the reference shell.\n",
+            "?                                     -------------\n",
+            "+ Lines like this were output only by your shell.\n",
+            "?                                     ++++\n",
+        ]
+        brief_lines = [
+            "  both shells\n",
+            "- reference shell\n",
+            "? ---------\n",
+            "+ your shell\n",
+            "? ++++\n",
+        ]
+
+        lines = verbose_lines if verbose else brief_lines
+        lines.extend(
+            [
+                "  \n",
+                f"- {ref_invocation}\n",
+                f"+ {you_invocation}\n",
+                "  \n",
+            ]
+        )
+
+        if verbose and not self._color_output:
+            lines.insert(
+                0,
+                "? Lines like this point at changes within the line above.\n",
+            )
+
+        return self.filter_comparison(lines)
+
+
+def run_runtrace(
+    trace: Path,
+    shell: str,
+    runtrace: str,
+    command_timeout: int,
+    trace_timeout: int,
+    verbose: int,
+) -> tuple[str, list[str]]:
+    """Run the trace file TRACE using the shell SHELL and capture all output.
+    If the 'runtrace' subprocess crashes for any reason, throw an exception,
+    otherwise return a 2-tuple whose first element is the runtrace command
+    and whose second element is the captured output as a list of lines."""
+    cmd = [
+        runtrace,
+        "-s", shell,
+        "-f", str(trace),
+        # "-t", str(command_timeout)  # not supported yet
+    ]
+    invocation = " ".join(shlex.quote(w) for w in cmd)
+    if verbose > 1:
+        sys.stdout.write(f"running {invocation}\n")
+    result = subprocess.run(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="backslashreplace",
+        timeout=trace_timeout,
+    )
+    status = result.returncode
+
+    # Because runtrace runs a shell and the shell monkeys around with
+    # process groups, we might not get a SIGINT when it does.
+    if status in (
+        -signal.SIGINT,
+        -signal.SIGTERM,
+        -signal.SIGQUIT,
+        -signal.SIGHUP,
+    ):
+        raise KeyboardInterrupt
+
+    output = split_lines_and_filter_whitespace(result.stdout)
+
+    if status > 0:
+        output.append(f"{runtrace}: exit {status}\n")
+        if verbose > 1:
+            sys.stdout.write(output[-1])
+
+    elif status < 0:
+        strsig = signal.strsignal(-status)
+        if strsig is None:
+            output.append(f"{runtrace}: killed by signal {-status}\n")
+        else:
+            output.append(f"{runtrace}: {strsig}\n")
+        if verbose > 1:
+            sys.stdout.write(output[-1])
+
+    return (invocation, output)
+
+
+def compare_shell_to_ref(
+    trace: Path,
+    *,
+    shell: str,
+    refshell: str,
+    runtrace: str,
+    verbose: int,
+    color: bool,
+    no_failures_yet: bool,
+    command_timeout: int,
+    trace_timeout: int,
+) -> bool:
+    """Run trace TRACE using SHELL and compare that to what happens when
+    the same trace is run using REFSHELL.  Based on this comparison,
+    decide whether SHELL has passed the test embodied by TRACE."""
+
+    (test_invocation, test_raw_output) = run_runtrace(
+        trace, shell, runtrace, command_timeout, trace_timeout, verbose
+    )
+    (ref_invocation, ref_raw_output) = run_runtrace(
+        trace, refshell, runtrace, command_timeout, trace_timeout, verbose
+    )
+
+    test_output = filter_runtrace_expected_variation(test_raw_output)
+    ref_output = filter_runtrace_expected_variation(ref_raw_output)
+
+    if color:
+        success = "\x1b[32mPASS\x1b[0m"
+        failure = "\x1b[91mFAIL\x1b[0m"
+    else:
+        success = "PASS"
+        failure = "FAIL"
+
+    differ = RuntraceOutputDiffer(color)
+
+    # Were they different in a way that matters?
+    (is_different, comparison) = differ.filtered_compare(
+        ref_output, test_output
+    )
+
+    if not is_different:
+        if verbose:
+            sys.stdout.write(
+                f"{success}: Test and reference outputs for {trace} matched.\n"
+            )
+        if verbose > 1:
+            sys.stdout.write(
+                "Printing comparison of unfiltered output for reference.\n"
+            )
+            sys.stdout.writelines(
+                differ.introduce(False, ref_invocation, test_invocation)
+            )
+            sys.stdout.writelines(
+                differ.filtered_compare(ref_raw_output, test_raw_output)[1]
+            )
+            sys.stdout.write("\n")
+        return True
+
+    # There were significant differences.
+    sys.stdout.write(
+        f"{failure}: Test and reference outputs for {trace} differed.\n"
+        "Comparison of output follows.\n"
+        "\n"
+    )
+    sys.stdout.writelines(
+        differ.introduce(
+            verbose > 1 or no_failures_yet, ref_invocation, test_invocation
+        )
+    )
+    sys.stdout.writelines(comparison)
+    sys.stdout.write("\n")
+    return False
+
+
+def eval_trace(
+    trace: Path,
+    *,
+    shell: str,
+    refshell: str,
+    runtrace: str,
+    iterations: int,
+    verbose: int,
+    color: bool,
+    no_failures_yet: bool,
+    command_timeout: int,
+    trace_timeout: int,
+) -> int:
+    """Evaluate SHELL's behavior on TRACE, ITERATIONS times."""
+    if iterations > 1:
+        sys.stdout.write(f"Running {iterations} iters of {str(trace)!r}\n")
+    else:
+        sys.stdout.write(f"Running {str(trace)!r}...\n")
+
+    successful = 0
+    for i in range(iterations):
+        if iterations > 1:
+            sys.stdout.write(f"Iteration {i+1}/{iterations}...\n")
+        try:
+            success = compare_shell_to_ref(
+                trace,
+                shell=shell,
+                refshell=refshell,
+                runtrace=runtrace,
+                verbose=verbose,
+                color=color,
+                no_failures_yet=no_failures_yet,
+                command_timeout=command_timeout,
+                trace_timeout=trace_timeout,
+            )
+        except (OSError, subprocess.CalledProcessError) as e:
+            sys.stdout.write(f"Error: {e}\n")
+            sys.exit(1)
+        if success:
+            successful += 1
+        else:
+            break
+
+    return successful
+
+
+def all_trace_files(trace_dir: Path) -> dict[int, Path]:
+    """Scan the directory TRACE_DIR for stock trace files.
+    These are expected to have names of the form
+    ${trace_dir}/trace[0-9]+.txt."""
+    traces: dict[int, Path] = {}
+
+    for f in trace_dir.glob("trace*.txt"):
+        try:
+            n = int(f.stem[len("trace") :])
+        except ValueError:
+            continue  # silently ignore e.g. "traceARGH.txt"
+        if n in traces:
+            sys.stderr.write(
+                f"{ME}: warning: ignoring {str(f)!r}:"
+                f" duplicate trace number {n}\n"
+                f"{ME}: note: previous file with number {n}:"
+                f" {str(traces[n])!r}\n"
+            )
+            continue
+
+        try:
+            os.close(os.open(f, os.O_RDONLY))
+        except OSError as e:
+            sys.stderr.write(
+                f"{ME}: warning: ignoring {str(f)!r}: {e.strerror}\n"
+            )
+            continue
+
+        traces[n] = f
+
+    return traces
+
+
+def trace_list(traces: None | list[str], trace_dir: Path) -> list[Path]:
+    """Expand the list of -t and -T options, originally given on the
+    command line, into a list of concrete trace files to be processed."""
+
+    def expand_trace(trace: str) -> Path:
+        try:
+            tn = int(trace)
+            return all_traces[tn]
+        except ValueError:
+            pass
+        except KeyError as e:
+            raise ValueError(
+                f"no stock trace with number {trace}"
+            ) from e
+
+        try:
+            os.close(os.open(trace, os.O_RDONLY))
+            return Path(trace)
+        except OSError as e:
+            raise ValueError(f"trace {trace!r}: {e.strerror}") from e
+
+    all_traces = all_trace_files(trace_dir)
+    if traces:
+        return [expand_trace(t) for t in traces]
+    else:
+        return [kv[1] for kv in sorted(all_traces.items())]
+
+
+def check_is_executable(prog: str, label: str) -> None:
+    """Verify that PROG is a program we can execute."""
+    try:
+        st = os.stat(prog)
+        if not stat.S_ISREG(st.st_mode) or not (st.st_mode & stat.S_IXUSR):
+            sys.stderr.write(
+                f"{ME}: error: {label} {prog!r}" "is not an executable file\n"
+            )
+            sys.exit(1)
+    except OSError as e:
+        sys.stderr.write(f"{ME}: error: {label} {prog!r}: {e.strerror}\n")
+        sys.exit(1)
+
+
+def main() -> int:
+    """Command line entry point."""
+
+    # --help shows only the options that students are likely to want
+    # to use; --help-all shows all the options. argparse doesn't really
+    # support this, we have to go behind its back somewhat.
+    show_all_options = "--help-all" in sys.argv
+
+    def hide(help: str) -> str:
+        return help if show_all_options else argparse.SUPPRESS
+
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        usage="%(prog)s [options] [trace [trace...]]",
+        add_help=False,
+    )
+
+    ap.add_argument(
+        "traces",
+        metavar="trace",
+        nargs="*",
+        help="Traces to run. You can use either file names or the"
+        f" numbers of files in the '{TRACES_DIR}' directory:"
+        f" for instance, '{TRACES_DIR}/trace01.txt' can be run"
+        " by using that name, or by using just '1'."
+        " File names are interpreted relative to"
+        " your current working directory, *not* the traces"
+        " directory. The default is to run all of the traces"
+        " in the traces directory.",
+    )
+
+    o1 = ap.add_argument_group("options")
+    o1.add_argument(
+        "-h",
+        "--help",
+        action="help",
+        help="Show a brief help message and exit.",
+    )
+    o1.add_argument(
+        "--help-all",
+        action="help",
+        help="Show a comprehensive help message, including"
+        " options that are mainly useful to course staff.",
+    )
+
+    o1.add_argument(
+        "-V",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Describe operations in detail."
+        " Repeat this option for even more detail.",
+    )
+    o1.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Whether to color-code output. The default"
+        " is 'auto', meaning to color-code only when stdout"
+        " is a terminal.",
+    )
+
+    o1.add_argument(
+        "-s",
+        "--shell",
+        default="./tsh",
+        help="Shell program to test. The default is './tsh'.",
+    )
+    o1.add_argument(
+        "-i",
+        "--iterations",
+        type=int,
+        metavar="K",
+        help="Number of times to run each trace."
+        f" The default is {TRACE_ITERATIONS} times when"
+        " running multiple traces, once when running just one.",
+    )
+
+    # for backward compatibility only, not visible in --help at all
+    o1.add_argument(
+        "-c",
+        action="store_const",
+        const="never",
+        dest="color",
+        help=argparse.SUPPRESS,
+    )
+    o1.add_argument(
+        "-C",
+        action="store_const",
+        const="always",
+        dest="color",
+        help=argparse.SUPPRESS,
+    )
+
+    o2 = ap.add_argument_group("less useful options")
+    o2.add_argument(
+        "--trace-dir",
+        type=Path,
+        default=TRACES_DIR,
+        metavar="DIR",
+        help=hide(
+            "Directory containing test traces."
+            f" The default is {TRACES_DIR!r}."
+        ),
+    )
+    o2.add_argument(
+        "--refshell",
+        default="./tshref",
+        help=hide("Reference shell implementation (default: ./tshref)"),
+    )
+    o2.add_argument(
+        "--runtrace",
+        default="./runtrace",
+        help=hide(
+            "Helper program for running a single trace"
+            " (default: ./runtrace)"
+        ),
+    )
+    o2.add_argument(
+        "--command-timeout",
+        type=int,
+        metavar="SECONDS",
+        default=COMMAND_TIMEOUT,
+        help=hide(
+            "How many seconds runtrace should wait for each"
+            " traced command to finish"
+            f" (default: {COMMAND_TIMEOUT})"
+        ),
+    )
+    o2.add_argument(
+        "--trace-timeout",
+        type=int,
+        metavar="SECONDS",
+        default=TRACE_TIMEOUT,
+        help=hide(
+            "How many seconds runtrace should wait for each"
+            " traced command to finish"
+            f" (default: {TRACE_TIMEOUT})"
+        ),
+    )
+
+    o2.add_argument(
+        "-A",
+        "--autograder",
+        action="store_true",
+        help=hide(
+            "Finish by printing a machine-readable score report"
+            " as expected by Autolab."
+        ),
+    )
+
+    args = ap.parse_args()
+
+    global ME
+    ME = ap.prog
+
+    if args.color == "auto":
+        color = os.isatty(sys.stdout.fileno())
+    else:
+        color = args.color == "always"
+
+    if args.autograder and args.traces:
+        ap.error("-A cannot be used with -t or -T")
+
+    check_is_executable(args.shell, "shell to test")
+    check_is_executable(args.refshell, "reference shell")
+    check_is_executable(args.runtrace, "runtrace helper")
+
+    try:
+        traces = trace_list(args.traces, args.trace_dir)
+    except ValueError as e:
+        sys.stderr.write(f"{ME}: error: {e}\n")
+        return 1
+
+    if args.iterations is None:
+        args.iterations = 1 if len(traces) == 1 else TRACE_ITERATIONS
+    elif args.iterations < 1:
+        ap.error("iteration count cannot be less than 1")
+    elif args.iterations > 25:
+        ap.error("iteration count cannot be greater than 25")
+
+    if args.command_timeout < 1:
+        ap.error("command timeout cannot be less than 1")
+    if args.trace_timeout <= args.command_timeout:
+        ap.error("trace timeout must be greater than command timeout")
+
+    if len(traces) == 1:
+        successes = eval_trace(
+            traces[0],
+            shell=args.shell,
+            refshell=args.refshell,
+            runtrace=args.runtrace,
+            iterations=args.iterations,
+            verbose=args.verbose,
+            color=color,
+            no_failures_yet=True,
+            command_timeout=args.command_timeout,
+            trace_timeout=args.trace_timeout,
+        )
+        sys.stdout.write(
+            f"\nSummary: {successes}/{args.iterations} correct iterations\n"
+        )
+        return 0 if successes == args.iterations else 1
+
+    else:
+        correct = 0
+        no_failures_yet = True
+        scoreboard: list[int | str] = []
+        for trace in traces:
+            successes = eval_trace(
+                trace,
+                shell=args.shell,
+                refshell=args.refshell,
+                runtrace=args.runtrace,
+                iterations=args.iterations,
+                verbose=args.verbose,
+                color=color,
+                no_failures_yet=no_failures_yet,
+                command_timeout=args.command_timeout,
+                trace_timeout=args.trace_timeout,
+            )
+            if successes < args.iterations:
+                no_failures_yet = False
+                scoreboard.append("n")
+            else:
+                correct += 1
+                scoreboard.append("y")
+
+        sys.stdout.write(f"\nSummary: {correct}/{len(traces)} correct traces\n")
+
+        if args.autograder:
+            import json
+
+            scoreboard.insert(0, correct)
+            sys.stdout.write("\n")
+            json.dump(
+                {"scores": {"correctness": correct}, "scoreboard": scoreboard},
+                sys.stdout,
+            )
+            sys.stdout.write("\n")
+
+            # In autograder mode, always exit successfully if we get
+            # this far.  Exiting unsuccessfully on a partially correct
+            # submission will cause autograde-Makefile to print
+            #   make: *** [Makefile:6: autograde] Error 1
+            # after the JSON score report, and that will make Autolab's
+            # log parser choke.
+            return 0
+        elif correct == len(traces):
+            return 0
+        else:
+            return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
