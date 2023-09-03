@@ -1,12 +1,12 @@
-# Simple Shell Implementation (Your Shell Name)
+# Simple Shell Implementation
 
 ## Overview
 
-This repository contains the implementation of a simple Unix shell, named [Your Shell Name]. This shell is a basic command-line interpreter that allows users to execute various commands and perform basic operations within a Unix-like environment.
+This repository contains the implementation of a simple Unix shell. This shell is a basic command-line interpreter that allows users to execute various commands and perform basic operations within a Unix-like environment.
 
 ## Features
 
-[Your Shell Name] provides the following features:
+It provides the following features:
 
 - **Command Execution**: The shell can execute external programs and built-in commands.
 
@@ -16,7 +16,7 @@ This repository contains the implementation of a simple Unix shell, named [Your 
 
 - **Job Control**: The shell handles job control, allowing users to run jobs in the foreground or background and manage them using job IDs.
 
-- **Built-in Commands**: [Your Shell Name] supports built-in commands like `quit`, `jobs`, `bg`, and `fg`.
+- **Built-in Commands**: It supports built-in commands like `quit`, `jobs`, `bg`, and `fg`.
 
 - **Signal Handling**: It correctly handles signals like SIGINT (Ctrl-C) and SIGTSTP (Ctrl-Z) for foreground and background processes.
 
@@ -24,7 +24,7 @@ This repository contains the implementation of a simple Unix shell, named [Your 
 
 ## Getting Started
 
-To run [Your Shell Name], follow these steps:
+To run the program, follow these steps:
 
 1. Clone this repository to your local machine:
 
