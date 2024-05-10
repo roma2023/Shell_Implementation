@@ -22,11 +22,3 @@ It provides the following features:
 
 - **Process Control**: The shell creates and manages child processes for command execution.
 
-## Getting Started
-
-To run the program, follow these steps:
-
-1. Clone this repository to your local machine:
-
-   ```bash
-   git clone <repository-url>
